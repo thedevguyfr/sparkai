@@ -1,80 +1,48 @@
-from flask import Flask, request, jsonify
+import os
+import discord
+from discord.ext import commands, tasks
 from g4f.client import Client
 import threading
-import base64
-import os
 
-app = Flask(__name__)
-client = Client()
-
-DEFAULT_SYSTEM_PROMPT = (
-    "You are SparkAi act like a very friendly ai "
-    "act more friendly than like a helpful ai meaning act more like a human friend "
-    "your name is SparkAi"
-)
-
+client_ai = Client()
+DEFAULT_SYSTEM_PROMPT = "You are SparkAi, act like a very friendly AI act more friendly than just a helpful AI, act like a human friend"
 active_bots = {}
 
-def extract_client_id(token):
-    try:
-        return base64.b64decode(token.split('.')[0] + '==').decode()
-    except:
-        return "UNKNOWN"
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-def run_bot_logic(bot_token, creator_id, user_prompt):
-    import discord
+def run_ai_bot(user_id, bot_name, system_prompt):
     from discord.ext import commands
 
     intents = discord.Intents.all()
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    user_bot = commands.Bot(command_prefix="!", intents=intents)
     chat_history = {}
 
-    system_prompt = user_prompt.strip() if user_prompt else DEFAULT_SYSTEM_PROMPT
-
-    @bot.event
+    @user_bot.event
     async def on_ready():
-        print(f"[+] {bot.user} is now online!")
-
-        activity = discord.Game(name="Created by SparkAi")
-        await bot.change_presence(status=discord.Status.online, activity=activity)
-
-        client_id = extract_client_id(bot_token)
-        invite_link = f"https://discord.com/oauth2/authorize?client_id={client_id}&scope=bot&permissions=0"
-
-        try:
-            user = await bot.fetch_user(int(creator_id))
-            await user.send(f"✅ Your AI bot is ready!\nInvite it: {invite_link}")
-        except discord.Forbidden:
-            print(f"[!] Could not DM creator {creator_id}. DMs may be off.")
-        except Exception as e:
-            print(f"[!] Error sending DM: {e}")
-
-        active_bots[bot_token] = {
-            "bot": bot,
-            "bot_name": str(bot.user),
-            "creator_id": creator_id,
+        active_bots[user_bot.user.id] = {
+            "bot": user_bot,
+            "bot_name": bot_name,
+            "creator_id": user_id,
             "system_prompt": system_prompt,
             "chat_history": chat_history
         }
 
-    @bot.event
+    @user_bot.event
     async def on_message(message):
         if message.author.bot:
             return
-
-        mentioned = bot.user in message.mentions
+        mentioned = user_bot.user in message.mentions
         is_dm = isinstance(message.channel, (discord.DMChannel, discord.GroupChannel))
-
         if mentioned or is_dm:
             uid = str(message.author.id)
-            prompt_text = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+            prompt_text = message.content.replace(f"<@{user_bot.user.id}>", "").replace(f"<@!{user_bot.user.id}>", "").strip()
             history = chat_history.setdefault(uid, [])
             history.append({"role": "user", "content": prompt_text})
             full_chat = [{"role": "system", "content": system_prompt}] + history
-
             try:
                 async with message.channel.typing():
-                    response = client.chat.completions.create(
+                    response = client_ai.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=full_chat,
                         web_search=False
@@ -84,88 +52,42 @@ def run_bot_logic(bot_token, creator_id, user_prompt):
                     await message.channel.send(reply)
             except Exception as e:
                 await message.channel.send("⚠️ Error: " + str(e))
+        await user_bot.process_commands(message)
 
-        await bot.process_commands(message)
+    threading.Thread(target=lambda: user_bot.run(os.environ["BOT_TOKEN"])).start()
 
-    bot.run(bot_token)
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
 
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({"status": "SparkAI API running."}), 200
+@bot.hybrid_command(name="createbot", description="Create your own AI bot")
+async def createbot(ctx, bot_name: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT):
+    run_ai_bot(ctx.author.id, bot_name, system_prompt)
+    await ctx.send(f"✅ AI bot `{bot_name}` is being created for you. Check DMs when it's ready.")
 
-@app.route("/create-bot", methods=["POST"])
-def create_bot():
-    data = request.json
-    token = data.get("token")
-    creator_id = data.get("creator_id")
-    system_prompt = data.get("system_prompt", "").strip()
+@bot.hybrid_command(name="listbots", description="List your active AI bots")
+async def listbots(ctx):
+    user_bots = [b["bot_name"] for b in active_bots.values() if b["creator_id"] == ctx.author.id]
+    if not user_bots:
+        await ctx.send("You have no active AI bots.")
+    else:
+        await ctx.send("Your active AI bots: " + ", ".join(user_bots))
 
-    if not token or not creator_id:
-        return jsonify({"error": "Missing token or creator_id"}), 400
+@bot.hybrid_command(name="deletebot", description="Delete one of your AI bots")
+async def deletebot(ctx, bot_name: str):
+    for bot_id, info in list(active_bots.items()):
+        if info["creator_id"] == ctx.author.id and info["bot_name"] == bot_name:
+            try:
+                user_bot = info["bot"]
+                loop = user_bot.loop
+                if loop.is_running():
+                    loop.call_soon_threadsafe(loop.stop)
+                del active_bots[bot_id]
+                await ctx.send(f"✅ AI bot `{bot_name}` has been deleted.")
+                return
+            except Exception as e:
+                await ctx.send(f"⚠️ Failed to delete `{bot_name}`: {e}")
+                return
+    await ctx.send(f"No AI bot named `{bot_name}` found.")
 
-    threading.Thread(target=run_bot_logic, args=(token, creator_id, system_prompt)).start()
-
-    return jsonify({
-        "status": "started",
-        "message": "Bot is starting. You will receive a DM when it's ready."
-    })
-
-@app.route("/list", methods=["GET"])
-def list_bots():
-    bot_list = []
-    for token, bot_info in active_bots.items():
-        bot_list.append({
-            "token": token[:6] + "..." + token[-6:],
-            "bot_name": bot_info["bot_name"],
-            "creator_id": bot_info["creator_id"]
-        })
-    return jsonify({
-        "status": "active",
-        "bots": bot_list
-    })
-
-@app.route("/turn-on-bot", methods=["POST"])
-def turn_on_bot():
-    data = request.json
-    token = data.get("token")
-    creator_id = data.get("creator_id")
-    system_prompt = data.get("system_prompt", "").strip()
-
-    if not token or not creator_id:
-        return jsonify({"error": "Missing token or creator_id"}), 400
-
-    if token in active_bots:
-        return jsonify({"error": "Bot is already running"}), 400
-
-    threading.Thread(target=run_bot_logic, args=(token, creator_id, system_prompt)).start()
-
-    return jsonify({
-        "status": "restarting",
-        "message": "Bot is being turned on again."
-    })
-
-@app.route("/delete-bot", methods=["POST"])
-def delete_bot():
-    data = request.json
-    token = data.get("token")
-
-    if not token:
-        return jsonify({"error": "Missing bot token"}), 400
-
-    bot_info = active_bots.get(token)
-    if not bot_info:
-        return jsonify({"error": "Bot not found or already stopped"}), 404
-
-    bot = bot_info["bot"]
-    try:
-        loop = bot.loop
-        if loop.is_running():
-            loop.call_soon_threadsafe(loop.stop)
-        del active_bots[token]
-        return jsonify({"status": "deleted", "message": "Bot has been stopped and removed."})
-    except Exception as e:
-        return jsonify({"error": "Failed to stop bot", "details": str(e)}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+bot.run(os.environ["BOT_TOKEN"])
